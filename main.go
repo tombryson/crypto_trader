@@ -7,7 +7,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"crypto_trader/db"
 	"crypto_trader/okx"
@@ -18,9 +21,17 @@ type Alert struct {
 	Signal string `json:"signal"`
 }
 
+type StateWithPrice struct {
+	Ticker     string
+	Signal     string
+	Position   float64
+	Price      float64
+	LastUpdate time.Time
+}
+
 var (
 	mu            sync.Mutex
-	defaultPairs  = []string{"BTC-USDT", "ETH-USDT", "BNB-USDT", "XRP-USDT", "ADA-USDT", "SOL-USDT", "DOGE-USDT"}
+	defaultPairs  = []string{"BTCUSDT", "TRXUSDT", "SUIUSDT", "SOLUSDT", "NEARUSDT", "TONUSDT", "ICPUSDT"}
 )
 
 func handler(w http.ResponseWriter, r *http.Request) {
@@ -78,7 +89,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	var totalCryptoValue float64
 	for _, pair := range defaultPairs {
 		if pos, ok := positions[pair]; ok {
-			totalCryptoValue += pos // Approximate value; in reality, multiply by current price
+			price := getCurrentPrice(pair)
+			totalCryptoValue += pos * price // Use real price for accurate value
 		}
 	}
 	availableFunds := spotBalance + totalCryptoValue
@@ -96,13 +108,25 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	if alert.Signal == "buy" {
 		if buyCount == 0 {
 			// First buy signal, allocate all spot funds
-			size := spotBalance / getCurrentPrice(alert.Ticker) // Simplified; needs real price API
+			price := getCurrentPrice(alert.Ticker)
+			if price == 0 {
+				log.Printf("Failed to get price for %s", alert.Ticker)
+				http.Error(w, "Failed to get price", http.StatusInternalServerError)
+				return
+			}
+			size := spotBalance / price
 			err = client.PlaceOrder(alert.Ticker, "buy", size)
 		} else {
 			// Calculate equal allocation
 			targetAllocation := availableFunds / float64(buyCount+1)
 			currentPos := currentState.Position
-			targetPos := targetAllocation / getCurrentPrice(alert.Ticker) // Simplified
+			price := getCurrentPrice(alert.Ticker)
+			if price == 0 {
+				log.Printf("Failed to get price for %s", alert.Ticker)
+				http.Error(w, "Failed to get price", http.StatusInternalServerError)
+				return
+			}
+			targetPos := targetAllocation / price
 
 			if currentPos > 0 {
 				// Sell excess if needed
@@ -128,8 +152,9 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update state in DB (position update would require price data)
-	db.UpdateState(alert.Ticker, alert.Signal, 0) // Placeholder; update with real position
+	// Update state in DB with real position size
+	newPosition := positions[alert.Ticker] // Update with actual position after order
+	db.UpdateState(alert.Ticker, alert.Signal, newPosition)
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "Alert processed: %s %s", alert.Ticker, alert.Signal)
@@ -144,6 +169,7 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 
+	// Get all states from DB
 	states, err := db.GetAllStates()
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
@@ -151,13 +177,44 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get current positions
+	client := okx.NewClient(
+		os.Getenv("OKX_API_KEY"),
+		os.Getenv("OKX_SECRET_KEY"),
+		os.Getenv("OKX_PASSPHRASE"),
+	)
+	positions, err := client.GetPositions()
+	if err != nil {
+		http.Error(w, "Failed to get positions", http.StatusInternalServerError)
+		log.Printf("Error getting positions: %v", err)
+		return
+	}
+
+	// Get current prices for all tickers
+	prices := getCurrentPrices(defaultPairs)
+
+	// Combine states with prices and positions
+	var statesWithPrice []StateWithPrice
+	for _, state := range states {
+		price := prices[state.Ticker]
+		position := positions[state.Ticker] // Real position from OKX
+		statesWithPrice = append(statesWithPrice, StateWithPrice{
+			Ticker:     state.Ticker,
+			Signal:     state.Signal,
+			Position:   position,
+			Price:      price,
+			LastUpdate: state.LastUpdate,
+		})
+	}
+
+	// Render the UI
 	tmpl := template.Must(template.New("state").Parse(`
 		<!DOCTYPE html>
 		<html>
 		<head>
 			<title>Ticker States</title>
 			<style>
-				table { border-collapse: collapse; width: 50%; }
+				table { border-collapse: collapse; width: 70%; }
 				th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
 				th { background-color: #f2f2f2; }
 				.buy { color: green; }
@@ -171,13 +228,15 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 					<th>Ticker</th>
 					<th>Signal</th>
 					<th>Position</th>
+					<th>Current Price (USDT)</th>
 					<th>Last Update</th>
 				</tr>
 				{{range .}}
 				<tr>
 					<td>{{.Ticker}}</td>
 					<td class="{{.Signal}}">{{.Signal}}</td>
-					<td>{{printf "%.2f" .Position}}</td>
+					<td>{{printf "%.4f" .Position}}</td>
+					<td>{{printf "%.2f" .Price}}</td>
 					<td>{{.LastUpdate.Format "2006-01-02 15:04:05"}}</td>
 				</tr>
 				{{end}}
@@ -186,7 +245,7 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 		</html>
 	`))
 
-	err = tmpl.Execute(w, states)
+	err = tmpl.Execute(w, statesWithPrice)
 	if err != nil {
 		http.Error(w, "Failed to render state", http.StatusInternalServerError)
 		log.Printf("Template error: %v", err)
@@ -194,9 +253,88 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func getCurrentPrice(ticker string) float64 {
-	// Placeholder: Replace with OKX market data API (e.g., /api/v5/market/ticker)
-	// For now, return a dummy price
-	return 60000.0 // Example price for BTC-USDT
+	baseURL := "https://www.okx.com"
+	endpoint := "/api/v5/market/ticker"
+	// Convert ticker to OKX format (e.g., BTCUSDT -> BTC-USDT)
+	instId := strings.Replace(ticker, "USDT", "-USDT", 1)
+	url := fmt.Sprintf("%s%s?instId=%s", baseURL, endpoint, instId)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Printf("Error fetching price for %s: %v", ticker, err)
+		return 0
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("OKX API error for %s: status %d", ticker, resp.StatusCode)
+		return 0
+	}
+
+	var result struct {
+		Data []struct {
+			Last string `json:"last"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		log.Printf("Error decoding price for %s: %v", ticker, err)
+		return 0
+	}
+
+	if len(result.Data) == 0 {
+		log.Printf("No price data for %s", ticker)
+		return 0
+	}
+
+	price, err := strconv.ParseFloat(result.Data[0].Last, 64)
+	if err != nil {
+		log.Printf("Error parsing price for %s: %v", ticker, err)
+		return 0
+	}
+	return price
+}
+
+func getCurrentPrices(tickers []string) map[string]float64 {
+	prices := make(map[string]float64)
+	var wg sync.WaitGroup
+	priceChan := make(chan struct {
+		ticker string
+		price  float64
+	}, len(tickers))
+
+	// Rate limit: OKX allows 3 requests per second per IP
+	const maxConcurrent = 3
+	sem := make(chan struct{}, maxConcurrent)
+
+	for _, ticker := range tickers {
+		wg.Add(1)
+		go func(t string) {
+			defer wg.Done()
+			sem <- struct{}{} // Acquire semaphore
+			defer func() { <-sem }() // Release semaphore
+
+			price := getCurrentPrice(t)
+			priceChan <- struct {
+				ticker string
+				price  float64
+			}{ticker: t, price: price}
+
+			// Sleep to respect rate limit (3 req/s = 333ms per request)
+			time.Sleep(333 * time.Millisecond)
+		}(ticker)
+	}
+
+	// Collect prices
+	go func() {
+		wg.Wait()
+		close(priceChan)
+	}()
+
+	for p := range priceChan {
+		prices[p.ticker] = p.price
+	}
+
+	return prices
 }
 
 func main() {

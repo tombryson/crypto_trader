@@ -34,7 +34,8 @@ func (c *Client) PlaceOrder(ticker, signal string, size float64) error {
 	baseURL := "https://www.okx.com"
 	endpoint := "/api/v5/trade/order"
 	timestamp := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
-	instrumentID := fmt.Sprintf("%s-USDT", strings.ToUpper(ticker))
+	// Convert ticker to OKX format (e.g., BTCUSDT -> BTC-USDT)
+	instrumentID := strings.Replace(strings.ToUpper(ticker), "USDT", "-USDT", 1)
 
 	var side string
 	if signal == "buy" {
@@ -141,8 +142,9 @@ func (c *Client) GetSpotBalance() (float64, error) {
 }
 
 func (c *Client) GetPositions() (map[string]float64, error) {
+	// Use /api/v5/asset/balances to get spot wallet balances
 	baseURL := "https://www.okx.com"
-	endpoint := "/api/v5/account/positions?instType=SPOT"
+	endpoint := "/api/v5/asset/balances"
 	timestamp := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
 	body := ""
 
@@ -159,6 +161,8 @@ func (c *Client) GetPositions() (map[string]float64, error) {
 	req.Header.Set("OK-ACCESS-PASSPHRASE", c.Passphrase)
 	req.Header.Set("Content-Type", "application/json")
 
+	log.Printf("Sending balances request to %s", req.URL.String())
+
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -168,13 +172,14 @@ func (c *Client) GetPositions() (map[string]float64, error) {
 
 	if resp.StatusCode != http.StatusOK {
 		bodyBytes, _ := io.ReadAll(resp.Body)
+		log.Printf("OKX API response body: %s", string(bodyBytes))
 		return nil, fmt.Errorf("OKX API error: %s, status: %d", string(bodyBytes), resp.StatusCode)
 	}
 
 	var result struct {
 		Data []struct {
-			InstId   string `json:"instId"`
-			Pos      string `json:"pos"`
+			Ccy   string `json:"ccy"`   // Currency, e.g., "BTC"
+			Bal   string `json:"bal"`   // Balance
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -182,14 +187,24 @@ func (c *Client) GetPositions() (map[string]float64, error) {
 	}
 
 	positions := make(map[string]float64)
-	for _, pos := range result.Data {
-		if strings.HasSuffix(pos.InstId, "-USDT") {
-			size, err := strconv.ParseFloat(pos.Pos, 64)
-			if err != nil {
-				return nil, err
-			}
-			positions[pos.InstId] = size
+	// Map currencies to tickers (e.g., "BTC" to "BTCUSDT")
+	for _, asset := range result.Data {
+		ticker := strings.ToUpper(asset.Ccy + "USDT")
+		balance, err := strconv.ParseFloat(asset.Bal, 64)
+		if err != nil {
+			log.Printf("Error parsing balance for %s: %v", asset.Ccy, err)
+			continue
+		}
+		positions[ticker] = balance
+	}
+
+	// Ensure all tickers in defaultPairs have an entry, even if balance is 0
+	defaultPairs := []string{"BTCUSDT", "TRXUSDT", "SUIUSDT", "SOLUSDT", "NEARUSDT", "TONUSDT", "ICPUSDT"}
+	for _, ticker := range defaultPairs {
+		if _, exists := positions[ticker]; !exists {
+			positions[ticker] = 0
 		}
 	}
+
 	return positions, nil
 }

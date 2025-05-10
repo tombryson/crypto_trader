@@ -41,7 +41,7 @@ func InitDB(dbPath string) {
 	}
 
 	// Initialize default 7 USDT pairs if not present
-	defaultPairs := []string{"BTC-USDT", "ETH-USDT", "BNB-USDT", "XRP-USDT", "ADA-USDT", "SOL-USDT", "DOGE-USDT"}
+	defaultPairs := []string{"BTCUSDT", "TRXUSDT", "SUIUSDT", "SOLUSDT", "NEARUSDT", "TONUSDT", "ICPUSDT"}
 	for _, pair := range defaultPairs {
 		var count int
 		err = db.QueryRow("SELECT COUNT(*) FROM ticker_states WHERE ticker = ?", pair).Scan(&count)
@@ -97,4 +97,13 @@ func GetAllStates() ([]TickerState, error) {
 		states = append(states, state)
 	}
 	return states, nil
+}
+
+func Close() {
+	if db != nil {
+		err := db.Close()
+		if err != nil {
+			log.Printf("Error closing database: %v", err)
+		}
+	}
 }
