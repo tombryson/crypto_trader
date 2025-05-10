@@ -7,11 +7,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -25,6 +27,16 @@ type OKXClient struct {
 	SecretKey string
 	Passphrase string
 }
+
+type TickerState struct {
+	Signal string
+	LastUpdate time.Time
+}
+
+var (
+	tickerStates = make(map[string]TickerState)
+	mu           sync.Mutex
+)
 
 func NewOKXClient(apiKey, secretKey, passphrase string) *OKXClient {
 	return &OKXClient{
@@ -61,7 +73,7 @@ func (c *OKXClient) placeOrder(ticker, signal string) error {
 		"tdMode":  "cash",
 		"side":    side,
 		"ordType": "market",
-		"sz":      "0.01", // Example size, adjust as needed
+		"sz":      os.Getenv("ORDER_SIZE"), // Use environment variable for size
 	}
 
 	bodyBytes, _ := json.Marshal(order)
@@ -117,6 +129,18 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		os.Getenv("OKX_PASSPHRASE"),
 	)
 
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Check if the ticker is already in the desired state to avoid redundant orders
+	currentState, exists := tickerStates[alert.Ticker]
+	if exists && currentState.Signal == alert.Signal {
+		log.Printf("Ticker %s already in %s state, skipping order", alert.Ticker, alert.Signal)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Alert processed (no action): %s %s", alert.Ticker, alert.Signal)
+		return
+	}
+
 	err := client.placeOrder(alert.Ticker, alert.Signal)
 	if err != nil {
 		log.Printf("Error placing order: %v", err)
@@ -124,12 +148,68 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Update ticker state
+	tickerStates[alert.Ticker] = TickerState{
+		Signal:     alert.Signal,
+		LastUpdate: time.Now(),
+	}
+
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "Alert processed: %s %s", alert.Ticker, alert.Signal)
 }
 
+func stateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	tmpl := template.Must(template.New("state").Parse(`
+		<!DOCTYPE html>
+		<html>
+		<head>
+			<title>Ticker States</title>
+			<style>
+				table { border-collapse: collapse; width: 50%; }
+				th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+				th { background-color: #f2f2f2; }
+				.buy { color: green; }
+				.sell { color: red; }
+			</style>
+		</head>
+		<body>
+			<h1>Ticker States</h1>
+			<table>
+				<tr>
+					<th>Ticker</th>
+					<th>Signal</th>
+					<th>Last Update</th>
+				</tr>
+				{{range $ticker, $state := .}}
+				<tr>
+					<td>{{$ticker}}</td>
+					<td class="{{$state.Signal}}">{{$state.Signal}}</td>
+					<td>{{$state.LastUpdate.Format "2006-01-02 15:04:05"}}</td>
+				</tr>
+				{{end}}
+			</table>
+		</body>
+		</html>
+	`))
+
+	err := tmpl.Execute(w, tickerStates)
+	if err != nil {
+		http.Error(w, "Failed to render state", http.StatusInternalServerError)
+		log.Printf("Template error: %v", err)
+	}
+}
+
 func main() {
 	http.HandleFunc("/webhook", handler)
+	http.HandleFunc("/state", stateHandler)
 	port := ":8080"
 	log.Printf("Server starting on port %s...", port)
 	if err := http.ListenAndServe(port, nil); err != nil {

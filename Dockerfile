@@ -6,8 +6,9 @@ RUN apk add --no-cache git gcc musl-dev sqlite-dev sqlite
 
 WORKDIR /app
 
-# Copy go.mod and go.sum first for caching dependencies.
-COPY go.mod go.sum ./
+# Copy go.mod first for caching dependencies (handle missing go.sum).
+COPY go.mod ./
+RUN if [ -f go.sum ]; then cp go.sum ./; fi
 RUN go mod download
 
 # Copy the rest of the application code.
@@ -19,7 +20,7 @@ RUN CGO_ENABLED=1 GOOS=linux go build -a -o crypto_trader .
 # Stage 2: Create the final image.
 FROM alpine:latest
 
-# Install the SQLite runtime library.
+# Install the SQLite runtime library (included for consistency, though not used).
 RUN apk add --no-cache sqlite
 
 # Set the working directory to /app so that our binary and credentials file are together.

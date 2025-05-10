@@ -1,9 +1,9 @@
-# fly.toml app configuration file generated for crypto-trader15-wispy-snow-9801 on 2025-05-10T16:17:21+10:00
+# fly.toml app configuration file generated for crypto-trader15-delicate-flower-4267 on 2025-05-10T16:19:59+10:00
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'crypto-trader15-wispy-snow-9801'
+app = 'crypto-trader15-delicate-flower-4267'
 primary_region = 'syd'
 
 [build]
