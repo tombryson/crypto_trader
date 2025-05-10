@@ -6,9 +6,12 @@ RUN apk add --no-cache git gcc musl-dev sqlite-dev sqlite
 
 WORKDIR /app
 
-# Copy go.mod first for caching dependencies (handle missing go.sum).
+# Copy go.mod first for caching dependencies.
 COPY go.mod ./
 RUN if [ -f go.sum ]; then cp go.sum ./; fi
+
+# Explicitly get the sqlite3 dependency and tidy up
+RUN go get github.com/mattn/go-sqlite3 && go mod tidy
 RUN go mod download
 
 # Copy the rest of the application code.
@@ -20,7 +23,7 @@ RUN CGO_ENABLED=1 GOOS=linux go build -a -o crypto_trader .
 # Stage 2: Create the final image.
 FROM alpine:latest
 
-# Install the SQLite runtime library (included for consistency, though not used).
+# Install the SQLite runtime library.
 RUN apk add --no-cache sqlite
 
 # Set the working directory to /app so that our binary and credentials file are together.
@@ -33,8 +36,8 @@ COPY --from=builder /app/crypto_trader /app/crypto_trader
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Expose port 8090 (adjust if needed).
-EXPOSE 8090
+# Expose port 8080 (updated from 8090 to match main.go).
+EXPOSE 8080
 
 # The environment variable GOOGLE_CREDS_BASE64 is set empty here by default.
 # On Fly, set it via `fly secrets set GOOGLE_CREDS_BASE64="base64-encoded-contents"`.

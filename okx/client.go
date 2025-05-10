@@ -15,12 +15,6 @@ import (
 	"time"
 )
 
-type Client struct {
-	APIKey    string
-	SecretKey string
-	Passphrase string
-}
-
 func NewClient(apiKey, secretKey, passphrase string) *Client {
 	return &Client{
 		APIKey:    apiKey,
