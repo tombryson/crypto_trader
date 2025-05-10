@@ -1,20 +1,16 @@
 package main
 
 import (
-	"bytes"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"html/template"
-	"io"
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
-	"time"
+
+	"crypto_trader/db"
+	"crypto_trader/okx"
 )
 
 type Alert struct {
@@ -22,94 +18,10 @@ type Alert struct {
 	Signal string `json:"signal"`
 }
 
-type OKXClient struct {
-	APIKey    string
-	SecretKey string
-	Passphrase string
-}
-
-type TickerState struct {
-	Signal string
-	LastUpdate time.Time
-}
-
 var (
-	tickerStates = make(map[string]TickerState)
-	mu           sync.Mutex
+	mu            sync.Mutex
+	defaultPairs  = []string{"BTC-USDT", "ETH-USDT", "BNB-USDT", "XRP-USDT", "ADA-USDT", "SOL-USDT", "DOGE-USDT"}
 )
-
-func NewOKXClient(apiKey, secretKey, passphrase string) *OKXClient {
-	return &OKXClient{
-		APIKey:    apiKey,
-		SecretKey: secretKey,
-		Passphrase: passphrase,
-	}
-}
-
-func (c *OKXClient) signRequest(timestamp, method, requestPath, body string) string {
-	message := fmt.Sprintf("%s%s%s%s", timestamp, strings.ToUpper(method), requestPath, body)
-	mac := hmac.New(sha256.New, []byte(c.SecretKey))
-	mac.Write([]byte(message))
-	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
-}
-
-func (c *OKXClient) placeOrder(ticker, signal string) error {
-	baseURL := "https://www.okx.com"
-	endpoint := "/api/v5/trade/order"
-	timestamp := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
-	instrumentID := fmt.Sprintf("%s-USDT", strings.ToUpper(ticker))
-
-	var side string
-	if signal == "buy" {
-		side = "buy"
-	} else if signal == "sell" {
-		side = "sell"
-	} else {
-		return fmt.Errorf("invalid signal: %s", signal)
-	}
-
-	order := map[string]string{
-		"instId":  instrumentID,
-		"tdMode":  "cash",
-		"side":    side,
-		"ordType": "market",
-		"sz":      os.Getenv("ORDER_SIZE"), // Use environment variable for size
-	}
-
-	bodyBytes, _ := json.Marshal(order)
-	body := string(bodyBytes)
-	if body == "{}" {
-		body = ""
-	}
-
-	signature := c.signRequest(timestamp, "POST", endpoint, body)
-
-	req, err := http.NewRequest("POST", baseURL+endpoint, bytes.NewBuffer([]byte(body)))
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("OK-ACCESS-KEY", c.APIKey)
-	req.Header.Set("OK-ACCESS-SIGN", signature)
-	req.Header.Set("OK-ACCESS-TIMESTAMP", timestamp)
-	req.Header.Set("OK-ACCESS-PASSPHRASE", c.Passphrase)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("OKX API error: %s, status: %d", string(bodyBytes), resp.StatusCode)
-	}
-
-	log.Printf("Order placed successfully for %s with signal %s", ticker, signal)
-	return nil
-}
 
 func handler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -123,7 +35,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	client := NewOKXClient(
+	client := okx.NewClient(
 		os.Getenv("OKX_API_KEY"),
 		os.Getenv("OKX_SECRET_KEY"),
 		os.Getenv("OKX_PASSPHRASE"),
@@ -132,27 +44,92 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Check if the ticker is already in the desired state to avoid redundant orders
-	currentState, exists := tickerStates[alert.Ticker]
-	if exists && currentState.Signal == alert.Signal {
+	// Get current state from DB
+	currentState, err := db.GetState(alert.Ticker)
+	if err != nil {
+		log.Printf("Error getting state for %s: %v", alert.Ticker, err)
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		return
+	}
+
+	// Skip if state hasn't changed
+	if currentState.Signal == alert.Signal {
 		log.Printf("Ticker %s already in %s state, skipping order", alert.Ticker, alert.Signal)
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "Alert processed (no action): %s %s", alert.Ticker, alert.Signal)
 		return
 	}
 
-	err := client.placeOrder(alert.Ticker, alert.Signal)
+	// Get current spot balance and positions
+	spotBalance, err := client.GetSpotBalance()
+	if err != nil {
+		log.Printf("Error getting spot balance: %v", err)
+		http.Error(w, "Failed to get balance", http.StatusInternalServerError)
+		return
+	}
+	positions, err := client.GetPositions()
+	if err != nil {
+		log.Printf("Error getting positions: %v", err)
+		http.Error(w, "Failed to get positions", http.StatusInternalServerError)
+		return
+	}
+
+	// Calculate total allocated and available funds
+	var totalCryptoValue float64
+	for _, pair := range defaultPairs {
+		if pos, ok := positions[pair]; ok {
+			totalCryptoValue += pos // Approximate value; in reality, multiply by current price
+		}
+	}
+	availableFunds := spotBalance + totalCryptoValue
+
+	// Count buy signals
+	buyCount := 0
+	for _, pair := range defaultPairs {
+		state, _ := db.GetState(pair)
+		if state.Signal == "buy" {
+			buyCount++
+		}
+	}
+
+	// Adjust positions based on new signal
+	if alert.Signal == "buy" {
+		if buyCount == 0 {
+			// First buy signal, allocate all spot funds
+			size := spotBalance / getCurrentPrice(alert.Ticker) // Simplified; needs real price API
+			err = client.PlaceOrder(alert.Ticker, "buy", size)
+		} else {
+			// Calculate equal allocation
+			targetAllocation := availableFunds / float64(buyCount+1)
+			currentPos := currentState.Position
+			targetPos := targetAllocation / getCurrentPrice(alert.Ticker) // Simplified
+
+			if currentPos > 0 {
+				// Sell excess if needed
+				if currentPos > targetPos {
+					sellSize := currentPos - targetPos
+					err = client.PlaceOrder(alert.Ticker, "sell", sellSize)
+				}
+			} else {
+				// Buy new position
+				buySize := targetPos
+				err = client.PlaceOrder(alert.Ticker, "buy", buySize)
+			}
+		}
+	} else if alert.Signal == "sell" {
+		if currentState.Position > 0 {
+			err = client.PlaceOrder(alert.Ticker, "sell", currentState.Position)
+		}
+	}
+
 	if err != nil {
 		log.Printf("Error placing order: %v", err)
 		http.Error(w, "Failed to place order", http.StatusInternalServerError)
 		return
 	}
 
-	// Update ticker state
-	tickerStates[alert.Ticker] = TickerState{
-		Signal:     alert.Signal,
-		LastUpdate: time.Now(),
-	}
+	// Update state in DB (position update would require price data)
+	db.UpdateState(alert.Ticker, alert.Signal, 0) // Placeholder; update with real position
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "Alert processed: %s %s", alert.Ticker, alert.Signal)
@@ -166,6 +143,13 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 
 	mu.Lock()
 	defer mu.Unlock()
+
+	states, err := db.GetAllStates()
+	if err != nil {
+		http.Error(w, "Database error", http.StatusInternalServerError)
+		log.Printf("Error getting states: %v", err)
+		return
+	}
 
 	tmpl := template.Must(template.New("state").Parse(`
 		<!DOCTYPE html>
@@ -186,13 +170,15 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 				<tr>
 					<th>Ticker</th>
 					<th>Signal</th>
+					<th>Position</th>
 					<th>Last Update</th>
 				</tr>
-				{{range $ticker, $state := .}}
+				{{range .}}
 				<tr>
-					<td>{{$ticker}}</td>
-					<td class="{{$state.Signal}}">{{$state.Signal}}</td>
-					<td>{{$state.LastUpdate.Format "2006-01-02 15:04:05"}}</td>
+					<td>{{.Ticker}}</td>
+					<td class="{{.Signal}}">{{.Signal}}</td>
+					<td>{{printf "%.2f" .Position}}</td>
+					<td>{{.LastUpdate.Format "2006-01-02 15:04:05"}}</td>
 				</tr>
 				{{end}}
 			</table>
@@ -200,14 +186,23 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 		</html>
 	`))
 
-	err := tmpl.Execute(w, tickerStates)
+	err = tmpl.Execute(w, states)
 	if err != nil {
 		http.Error(w, "Failed to render state", http.StatusInternalServerError)
 		log.Printf("Template error: %v", err)
 	}
 }
 
+func getCurrentPrice(ticker string) float64 {
+	// Placeholder: Replace with OKX market data API (e.g., /api/v5/market/ticker)
+	// For now, return a dummy price
+	return 60000.0 // Example price for BTC-USDT
+}
+
 func main() {
+	db.InitDB("/data/crypto_trader.db")
+	defer db.Close()
+
 	http.HandleFunc("/webhook", handler)
 	http.HandleFunc("/state", stateHandler)
 	port := ":8080"
