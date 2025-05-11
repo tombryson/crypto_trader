@@ -1,9 +1,13 @@
 package main
 
 import (
+	"crypto_trader/db"
+	"crypto_trader/okx"
+	crypto_trader "crypto_trader/testsuite"
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -11,11 +15,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"crypto_trader/db"
-	"crypto_trader/okx"
-	"crypto_trader/testsuite"
-	"io/ioutil"
 )
 
 type Alert struct {
@@ -43,20 +42,66 @@ type Transaction struct {
 	Timestamp time.Time
 }
 
-type OrderResponse struct {
-	Code string `json:"code"`
-	Msg  string `json:"msg"`
-	Data []struct {
-		OrdId     string `json:"ordId"`
-		InstId    string `json:"instId"`
-		State     string `json:"state"`
-	} `json:"data"`
-}
-
 var (
 	mu            sync.Mutex
 	defaultPairs  = []string{"BTCUSDT", "TRXUSDT", "SUIUSDT", "SOLUSDT", "NEARUSDT", "TONUSDT", "ICPUSDT"}
+	lotSizes      = make(map[string]float64)
 )
+
+func fetchLotSizes() error {
+	baseURL := "https://www.okx.com"
+	endpoint := "/api/v5/public/instruments?instType=SPOT"
+	url := fmt.Sprintf("%s%s", baseURL, endpoint)
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("error fetching instrument details: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("OKX API error: status %d, body %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Data []struct {
+			InstId string `json:"instId"`
+			LotSz  string `json:"lotSz"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return fmt.Errorf("error decoding instrument details: %v", err)
+	}
+
+	for _, inst := range result.Data {
+		ticker := strings.Replace(inst.InstId, "-USDT", "USDT", 1)
+		if contains(defaultPairs, ticker) {
+			lotSz, err := strconv.ParseFloat(inst.LotSz, 64)
+			if err != nil {
+				log.Printf("Error parsing lotSz for %s: %v", ticker, err)
+				continue
+			}
+			lotSizes[ticker] = lotSz
+			log.Printf("Fetched lotSz: %f for %s", lotSz, ticker)
+		}
+	}
+
+	if len(lotSizes) != len(defaultPairs) {
+		return fmt.Errorf("failed to fetch lot sizes for all pairs")
+	}
+
+	return nil
+}
+
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
 
 func handler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -66,7 +111,15 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	var alert Alert
 	if err := json.NewDecoder(r.Body).Decode(&alert); err != nil {
+		log.Printf("Invalid JSON payload: %v", err)
 		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+	log.Printf("Received alert: Ticker=%s, Signal=%s", alert.Ticker, alert.Signal)
+
+	if !isValidTicker(alert.Ticker) {
+		log.Printf("Invalid ticker: %s", alert.Ticker)
+		http.Error(w, "Invalid ticker", http.StatusBadRequest)
 		return
 	}
 
@@ -79,46 +132,47 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Get current state from DB
 	currentState, err := db.GetState(alert.Ticker)
 	if err != nil {
 		log.Printf("Error getting state for %s: %v", alert.Ticker, err)
 		http.Error(w, "Database error", http.StatusInternalServerError)
 		return
 	}
+	log.Printf("Retrieved state for %s: Signal=%s, Position=%f, LastUpdate=%s",
+		alert.Ticker, currentState.Signal, currentState.Position, currentState.LastUpdate)
 
-	// Skip if state hasn't changed
 	if currentState.Signal == alert.Signal {
-		log.Printf("Ticker %s already in %s state, skipping order", alert.Ticker, alert.Signal)
+		log.Printf("Ticker %s already in %s state, skipping order (to force order, remove this check for testing)",
+			alert.Ticker, alert.Signal)
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "Alert processed (no action): %s %s", alert.Ticker, alert.Signal)
 		return
 	}
 
-	// Get current spot balance and positions
 	spotBalance, err := client.GetSpotBalance()
 	if err != nil {
 		log.Printf("Error getting spot balance: %v", err)
 		http.Error(w, "Failed to get balance", http.StatusInternalServerError)
 		return
 	}
+	log.Printf("Spot balance: %f USDT", spotBalance)
+
 	positions, err := client.GetPositions()
 	if err != nil {
 		log.Printf("Error getting positions: %v", err)
 		http.Error(w, "Failed to get positions", http.StatusInternalServerError)
 		return
 	}
-	
+	log.Printf("Current positions: %v", positions)
 
-	// Get current price
 	price := getCurrentPrice(alert.Ticker)
 	if price == 0 {
 		log.Printf("Failed to get price for %s", alert.Ticker)
 		http.Error(w, "Failed to get price", http.StatusInternalServerError)
 		return
 	}
+	log.Printf("Current price for %s: %f", alert.Ticker, price)
 
-	// Calculate total allocated and available funds
 	var totalCryptoValue float64
 	for _, pair := range defaultPairs {
 		if pos, ok := positions[pair]; ok {
@@ -127,8 +181,8 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	availableFunds := spotBalance + totalCryptoValue
+	log.Printf("Total crypto value: %f, Available funds: %f", totalCryptoValue, availableFunds)
 
-	// Count buy signals
 	buyCount := 0
 	for _, pair := range defaultPairs {
 		state, _ := db.GetState(pair)
@@ -136,179 +190,144 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			buyCount++
 		}
 	}
+	log.Printf("Number of buy signals: %d", buyCount)
 
 	var size float64
-	var orderId string
+	var orderPlaced bool
+	lotSize := lotSizes[alert.Ticker]
+
 	if alert.Signal == "buy" {
 		if buyCount == 0 {
-			// First buy signal, allocate all spot funds
 			size = spotBalance / price
+			log.Printf("First buy signal for %s, allocating all funds: size=%f", alert.Ticker, size)
 		} else {
-			// Calculate equal allocation
 			targetAllocation := availableFunds / float64(buyCount+1)
 			currentPos := currentState.Position
 			targetPos := targetAllocation / price
+			log.Printf("Target allocation for %s: %f, Target position: %f", alert.Ticker, targetAllocation, targetPos)
 
 			if currentPos > 0 {
-				// Sell excess if needed
 				if currentPos > targetPos {
 					size = currentPos - targetPos
+					log.Printf("Selling excess for %s: size=%f", alert.Ticker, size)
 					err = client.PlaceOrder(alert.Ticker, "sell", size)
 					if err == nil {
-						orderId, err = checkOrderStatus(client, alert.Ticker, "sell", size)
-						if err == nil && orderId != "" {
-							usdtValue := size * price
-							db.RecordTransaction(alert.Ticker, "sell", size, price, usdtValue)
-							log.Printf("Sell order %s for %s confirmed, size %f", orderId, alert.Ticker, size)
-						} else {
-							log.Printf("Sell order for %s failed or not filled: %v", alert.Ticker, err)
-						}
+						usdtValue := size * price
+						db.RecordTransaction(alert.Ticker, "sell", size, price, usdtValue)
+						log.Printf("Sell order placed for %s, size=%f, USDT value=%f", alert.Ticker, size, usdtValue)
+						orderPlaced = true
 					}
 				}
 			} else {
-				// Buy new position
 				size = targetPos
+				log.Printf("Buying new position for %s: size=%f", alert.Ticker, size)
 			}
 		}
+
+		// Enforce minimum order value of 10 USDT
+		minOrderValueUSDT := 10.0
+		minSizeForValue := minOrderValueUSDT / price
+		if size < minSizeForValue {
+			log.Printf("Adjusted size for %s from %.8f to %.8f to meet minimum order value of %.2f USDT", alert.Ticker, size, minSizeForValue, minOrderValueUSDT)
+			size = minSizeForValue
+		}
+
+		// Round size to lot size precision
+		if lotSize > 0 {
+			size = float64(int(size/lotSize)) * lotSize
+		}
+
+		// Check if we have enough funds for the adjusted size
+		usdtValue := size * price
+		if usdtValue > spotBalance {
+			log.Printf("Insufficient funds for %s: need %.2f USDT, have %.2f USDT", alert.Ticker, usdtValue, spotBalance)
+			http.Error(w, "Insufficient funds", http.StatusInternalServerError)
+			return
+		}
+
 		if size > 0 {
+			log.Printf("Attempting to place buy order for %s with size %.8f", alert.Ticker, size)
 			err = client.PlaceOrder(alert.Ticker, "buy", size)
 			if err == nil {
-				orderId, err = checkOrderStatus(client, alert.Ticker, "buy", size)
-				if err == nil && orderId != "" {
-					usdtValue := size * price
-					db.RecordTransaction(alert.Ticker, "buy", size, price, usdtValue)
-					log.Printf("Buy order %s for %s confirmed, size %f", orderId, alert.Ticker, size)
-				} else {
-					log.Printf("Buy order for %s failed or not filled: %v", alert.Ticker, err)
-				}
+				usdtValue := size * price
+				db.RecordTransaction(alert.Ticker, "buy", size, price, usdtValue)
+				log.Printf("Buy order placed for %s, size=%.8f, USDT value=%.2f", alert.Ticker, size, usdtValue)
+				orderPlaced = true
+			} else {
+				log.Printf("Failed to place buy order for %s: %v", alert.Ticker, err)
 			}
 		}
 	} else if alert.Signal == "sell" {
 		if currentState.Position > 0 {
 			size = currentState.Position
+			// Enforce minimum order value of 10 USDT
+			minOrderValueUSDT := 10.0
+			minSizeForValue := minOrderValueUSDT / price
+			if size < minSizeForValue {
+				log.Printf("Adjusted size for %s from %.8f to %.8f to meet minimum order value of %.2f USDT", alert.Ticker, size, minSizeForValue, minOrderValueUSDT)
+				size = minSizeForValue
+			}
+			// Round size to lot size precision
+			if lotSize > 0 {
+				size = float64(int(size/lotSize)) * lotSize
+			}
+			log.Printf("Selling entire position for %s: size=%.8f", alert.Ticker, size)
 			err = client.PlaceOrder(alert.Ticker, "sell", size)
 			if err == nil {
-				orderId, err = checkOrderStatus(client, alert.Ticker, "sell", size)
-				if err == nil && orderId != "" {
-					usdtValue := size * price
-					db.RecordTransaction(alert.Ticker, "sell", size, price, usdtValue)
-					log.Printf("Sell order %s for %s confirmed, size %f", orderId, alert.Ticker, size)
-				} else {
-					log.Printf("Sell order for %s failed or not filled: %v", alert.Ticker, err)
-				}
+				usdtValue := size * price
+				db.RecordTransaction(alert.Ticker, "sell", size, price, usdtValue)
+				log.Printf("Sell order placed for %s, size=%.8f, USDT value=%.2f", alert.Ticker, size, usdtValue)
+				orderPlaced = true
+			} else {
+				log.Printf("Failed to place sell order for %s: %v", alert.Ticker, err)
 			}
+		} else {
+			log.Printf("No position to sell for %s", alert.Ticker)
 		}
 	}
 
 	if err != nil {
-		log.Printf("Error placing order: %v", err)
+		log.Printf("Error placing order for %s: %v", alert.Ticker, err)
 		http.Error(w, "Failed to place order", http.StatusInternalServerError)
 		return
 	}
 
-	// Update state in DB with real position size
-	newPosition := positions[alert.Ticker]
-	db.UpdateState(alert.Ticker, alert.Signal, newPosition)
-
-	// Record account value
-	totalAccountValue := spotBalance
-	for _, pair := range defaultPairs {
-		if pos, ok := positions[pair]; ok {
-			totalAccountValue += pos * getCurrentPrice(pair)
+	if orderPlaced {
+		time.Sleep(2 * time.Second)
+		positions, err = client.GetPositions()
+		if err != nil {
+			log.Printf("Error updating positions after order: %v", err)
+		} else {
+			newPosition := positions[alert.Ticker]
+			db.UpdateState(alert.Ticker, alert.Signal, newPosition)
+			log.Printf("Updated state for %s: Signal=%s, Position=%.8f", alert.Ticker, alert.Signal, newPosition)
 		}
+
+		spotBalance, err = client.GetSpotBalance()
+		if err != nil {
+			log.Printf("Error getting spot balance after order: %v", err)
+		}
+		totalAccountValue := spotBalance
+		for _, pair := range defaultPairs {
+			if pos, ok := positions[pair]; ok {
+				totalAccountValue += pos * getCurrentPrice(pair)
+			}
+		}
+		db.RecordAccountValue(totalAccountValue)
+		log.Printf("Recorded total account value: %f", totalAccountValue)
 	}
-	db.RecordAccountValue(totalAccountValue)
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "Alert processed: %s %s", alert.Ticker, alert.Signal)
 }
 
-func checkOrderStatus(client *okx.Client, ticker, side string, size float64) (string, error) {
-	endpoint := "/api/v5/trade/order"
-	instId := strings.Replace(ticker, "USDT", "-USDT", 1)
-
-	// Place the order and assume PlaceOrder handles the request
-	orderParams := map[string]string{
-		"instId":  instId,
-		"tdMode":  "cash",
-		"side":    side,
-		"ordType": "market",
-		"sz":      fmt.Sprintf("%.2f", size),
-	}
-	resp, err := client.PlaceOrderWithResponse(alert.Ticker, side, size) // Assuming this returns the response
-	if err != nil {
-		return "", err
-	}
-
-	// Parse the response to get the order ID
-	var orderResp OrderResponse
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if err := json.Unmarshal(body, &orderResp); err != nil {
-		return "", err
-	}
-
-	if orderResp.Code != "0" {
-		return "", fmt.Errorf("OKX API error: %s", orderResp.Msg)
-	}
-
-	if len(orderResp.Data) == 0 {
-		return "", fmt.Errorf("no order data returned")
-	}
-
-	orderId := orderResp.Data[0].OrdId
-	log.Printf("Order placed, ID: %s, InstId: %s, State: %s", orderId, instId, orderResp.Data[0].State)
-
-	// Poll until the order is filled or timed out
-	timeout := time.After(10 * time.Second)
-	tickerPoll := time.NewTicker(1 * time.Second)
-	defer tickerPoll.Stop()
-
-	for {
-		select {
-		case <-timeout:
-			return "", fmt.Errorf("order %s timed out", orderId)
-		case <-tickerPoll.C:
-			// Create a new request to check order status
-			params := map[string]string{
-				"instId": instId,
-				"ordId":  orderId,
-			}
-			resp, err := client.GetOrderStatus(instId, orderId) // Assuming this method exists
-			if err != nil {
-				return "", err
-			}
-
-			body, err := ioutil.ReadAll(resp.Body)
-			if err != nil {
-				return "", err
-			}
-			defer resp.Body.Close()
-
-			var statusResp OrderResponse
-			if err := json.Unmarshal(body, &statusResp); err != nil {
-				return "", err
-			}
-
-			if statusResp.Code != "0" {
-				return "", fmt.Errorf("OKX API error checking status: %s", statusResp.Msg)
-			}
-
-			if len(statusResp.Data) == 0 {
-				continue
-			}
-
-			state := statusResp.Data[0].State
-			log.Printf("Order %s status: %s", orderId, state)
-			if state == "filled" {
-				return orderId, nil
-			}
+func isValidTicker(ticker string) bool {
+	for _, pair := range defaultPairs {
+		if pair == ticker {
+			return true
 		}
 	}
+	return false
 }
 
 func stateHandler(w http.ResponseWriter, r *http.Request) {
@@ -320,7 +339,6 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	// Get all states from DB
 	states, err := db.GetAllStates()
 	if err != nil {
 		http.Error(w, "Database error", http.StatusInternalServerError)
@@ -328,7 +346,6 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get current positions
 	client := okx.NewClient(
 		os.Getenv("OKX_API_KEY"),
 		os.Getenv("OKX_SECRET_KEY"),
@@ -341,7 +358,6 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get USDT balance
 	usdtBalance, err := client.GetSpotBalance()
 	if err != nil {
 		http.Error(w, "Failed to get USDT balance", http.StatusInternalServerError)
@@ -349,10 +365,8 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Get current prices for all tickers
 	prices := getCurrentPrices(defaultPairs)
 
-	// Combine states with prices, positions, and USDT balance
 	var statesWithPrice []StateWithPrice
 	var totalAccountValue float64 = usdtBalance
 	for _, state := range states {
@@ -371,13 +385,11 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Get historical account values
 	accountValues, err := db.GetAccountValues()
 	if err != nil {
 		log.Printf("Error getting account values: %v", err)
 	}
 
-	// Calculate percentage gain/loss per ticker
 	pairPerformance := make(map[string]float64)
 	for _, ticker := range defaultPairs {
 		transactions, err := db.GetTransactions(ticker)
@@ -400,7 +412,6 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Render the UI
 	tmpl := template.Must(template.New("state").Parse(`
 		<!DOCTYPE html>
 		<html>
@@ -437,7 +448,7 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 				<tr>
 					<td>{{.Ticker}}</td>
 					<td class="{{.Signal}}">{{.Signal}}</td>
-					<td>{{printf "%.4f" .Position}}</td>
+					<td>{{printf "%.8f" .Position}}</td>
 					<td>{{printf "%.2f" .PositionValue}}</td>
 					<td>{{printf "%.2f" .Price}}</td>
 					<td>{{printf "%.2f" (index $.PairPerformance .Ticker)}}%</td>
@@ -495,9 +506,14 @@ func testHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Println("Starting test suite...")
-	results := testsuite.RunTests("https://crypto-trader15-delicate-flower-4267.fly.dev/webhook")
+	client := okx.NewClient(
+		os.Getenv("OKX_API_KEY"),
+		os.Getenv("OKX_SECRET_KEY"),
+		os.Getenv("OKX_PASSPHRASE"),
+	)
 
-	// Render test results
+	results := crypto_trader.RunTests("https://crypto-trader15-delicate-flower-4267.fly.dev/webhook", client)
+
 	w.Header().Set("Content-Type", "text/plain")
 	fmt.Fprintln(w, "Test Suite Results:")
 	for _, result := range results {
@@ -533,12 +549,7 @@ func getCurrentPrice(ticker string) float64 {
 			Last string `json:"last"`
 		} `json:"data"`
 	}
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("Error reading response for %s: %v", ticker, err)
-		return 0
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		log.Printf("Error decoding price for %s: %v", ticker, err)
 		return 0
 	}
@@ -599,6 +610,10 @@ func getCurrentPrices(tickers []string) map[string]float64 {
 func main() {
 	db.InitDB("/data/crypto_trader.db")
 	defer db.Close()
+
+	if err := fetchLotSizes(); err != nil {
+		log.Fatalf("Failed to fetch lot sizes: %v", err)
+	}
 
 	http.HandleFunc("/webhook", handler)
 	http.HandleFunc("/state", stateHandler)

@@ -242,3 +242,16 @@ func Close() {
 		db.Close()
 	}
 }
+
+// ResetState resets the state for a given ticker
+func ResetState(ticker, signal string, position float64) error {
+	mu.Lock()
+	defer mu.Unlock()
+
+	_, err := db.Exec("INSERT OR REPLACE INTO states (ticker, signal, position, last_update) VALUES (?, ?, ?, ?)",
+		ticker, signal, position, time.Now())
+	if err != nil {
+		return err
+	}
+	return nil
+}

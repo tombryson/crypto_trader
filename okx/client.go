@@ -15,6 +15,14 @@ import (
 	"time"
 )
 
+type OrderResponse struct {
+	Code string `json:"code"`
+	Msg  string `json:"msg"`
+	Data []struct {
+		OrdID string `json:"ordId"`
+	} `json:"data"`
+}
+
 func NewClient(apiKey, secretKey, passphrase string) *Client {
 	return &Client{
 		APIKey:     apiKey,
@@ -50,23 +58,25 @@ func (c *Client) PlaceOrder(ticker, signal string, size float64) error {
 		return fmt.Errorf("invalid signal: %s", signal)
 	}
 
+	// Format size with higher precision (8 decimal places for BTC-USDT)
 	order := map[string]string{
 		"instId":  instrumentID,
 		"tdMode":  "cash",
 		"side":    side,
 		"ordType": "market",
-		"sz":      fmt.Sprintf("%.2f", size),
+		"sz":      fmt.Sprintf("%.8f", size),
 	}
 
-	bodyBytes, _ := json.Marshal(order)
-	body := string(bodyBytes)
-	if body == "{}" {
-		body = ""
+	bodyBytes, err := json.Marshal(order)
+	if err != nil {
+		return fmt.Errorf("failed to marshal order: %v", err)
 	}
+	body := string(bodyBytes)
+	log.Printf("Sending order request: %s", body) // Log the request payload
 
 	timestamp, signature := c.signRequest("POST", endpoint, body)
 
-	req, err := http.NewRequest("POST", baseURL+endpoint, bytes.NewBuffer([]byte(body)))
+	req, err := http.NewRequest("POST", baseURL+endpoint, bytes.NewBuffer(bodyBytes))
 	if err != nil {
 		return err
 	}
@@ -84,12 +94,27 @@ func (c *Client) PlaceOrder(ticker, signal string, size float64) error {
 	}
 	defer resp.Body.Close()
 
+	bodyBytes, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response: %v", err)
+	}
+	log.Printf("OKX API response: %s", string(bodyBytes)) // Log the response
+
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("OKX API error: %s, status: %d", string(bodyBytes), resp.StatusCode)
 	}
 
-	log.Printf("Order placed successfully for %s with signal %s, size %.2f", ticker, signal, size)
+	// Parse the response to check for API-level errors
+	var orderResp OrderResponse
+	if err := json.Unmarshal(bodyBytes, &orderResp); err != nil {
+		return fmt.Errorf("failed to unmarshal response: %v", err)
+	}
+
+	if orderResp.Code != "0" {
+		return fmt.Errorf("OKX API order error: code=%s, msg=%s", orderResp.Code, orderResp.Msg)
+	}
+
+	log.Printf("Order placed successfully for %s with signal %s, size %.8f", ticker, signal, size)
 	return nil
 }
 
