@@ -14,6 +14,8 @@ import (
 
 	"crypto_trader/db"
 	"crypto_trader/okx"
+	"crypto_trader/testsuite"
+	"io/ioutil"
 )
 
 type Alert struct {
@@ -22,11 +24,33 @@ type Alert struct {
 }
 
 type StateWithPrice struct {
-	Ticker     string
-	Signal     string
-	Position   float64
-	Price      float64
-	LastUpdate time.Time
+	Ticker      string
+	Signal      string
+	Position    float64
+	Price       float64
+	PositionValue float64 // Value of the position in USDT
+	LastUpdate  time.Time
+	USDTBalance float64
+}
+
+type Transaction struct {
+	ID        int
+	Ticker    string
+	Signal    string
+	Amount    float64
+	Price     float64
+	USDTValue float64
+	Timestamp time.Time
+}
+
+type OrderResponse struct {
+	Code string `json:"code"`
+	Msg  string `json:"msg"`
+	Data []struct {
+		OrdId     string `json:"ordId"`
+		InstId    string `json:"instId"`
+		State     string `json:"state"`
+	} `json:"data"`
 }
 
 var (
@@ -84,13 +108,22 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to get positions", http.StatusInternalServerError)
 		return
 	}
+	
+
+	// Get current price
+	price := getCurrentPrice(alert.Ticker)
+	if price == 0 {
+		log.Printf("Failed to get price for %s", alert.Ticker)
+		http.Error(w, "Failed to get price", http.StatusInternalServerError)
+		return
+	}
 
 	// Calculate total allocated and available funds
 	var totalCryptoValue float64
 	for _, pair := range defaultPairs {
 		if pos, ok := positions[pair]; ok {
 			price := getCurrentPrice(pair)
-			totalCryptoValue += pos * price // Use real price for accurate value
+			totalCryptoValue += pos * price
 		}
 	}
 	availableFunds := spotBalance + totalCryptoValue
@@ -104,45 +137,66 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Adjust positions based on new signal
+	var size float64
+	var orderId string
 	if alert.Signal == "buy" {
 		if buyCount == 0 {
 			// First buy signal, allocate all spot funds
-			price := getCurrentPrice(alert.Ticker)
-			if price == 0 {
-				log.Printf("Failed to get price for %s", alert.Ticker)
-				http.Error(w, "Failed to get price", http.StatusInternalServerError)
-				return
-			}
-			size := spotBalance / price
-			err = client.PlaceOrder(alert.Ticker, "buy", size)
+			size = spotBalance / price
 		} else {
 			// Calculate equal allocation
 			targetAllocation := availableFunds / float64(buyCount+1)
 			currentPos := currentState.Position
-			price := getCurrentPrice(alert.Ticker)
-			if price == 0 {
-				log.Printf("Failed to get price for %s", alert.Ticker)
-				http.Error(w, "Failed to get price", http.StatusInternalServerError)
-				return
-			}
 			targetPos := targetAllocation / price
 
 			if currentPos > 0 {
 				// Sell excess if needed
 				if currentPos > targetPos {
-					sellSize := currentPos - targetPos
-					err = client.PlaceOrder(alert.Ticker, "sell", sellSize)
+					size = currentPos - targetPos
+					err = client.PlaceOrder(alert.Ticker, "sell", size)
+					if err == nil {
+						orderId, err = checkOrderStatus(client, alert.Ticker, "sell", size)
+						if err == nil && orderId != "" {
+							usdtValue := size * price
+							db.RecordTransaction(alert.Ticker, "sell", size, price, usdtValue)
+							log.Printf("Sell order %s for %s confirmed, size %f", orderId, alert.Ticker, size)
+						} else {
+							log.Printf("Sell order for %s failed or not filled: %v", alert.Ticker, err)
+						}
+					}
 				}
 			} else {
 				// Buy new position
-				buySize := targetPos
-				err = client.PlaceOrder(alert.Ticker, "buy", buySize)
+				size = targetPos
+			}
+		}
+		if size > 0 {
+			err = client.PlaceOrder(alert.Ticker, "buy", size)
+			if err == nil {
+				orderId, err = checkOrderStatus(client, alert.Ticker, "buy", size)
+				if err == nil && orderId != "" {
+					usdtValue := size * price
+					db.RecordTransaction(alert.Ticker, "buy", size, price, usdtValue)
+					log.Printf("Buy order %s for %s confirmed, size %f", orderId, alert.Ticker, size)
+				} else {
+					log.Printf("Buy order for %s failed or not filled: %v", alert.Ticker, err)
+				}
 			}
 		}
 	} else if alert.Signal == "sell" {
 		if currentState.Position > 0 {
-			err = client.PlaceOrder(alert.Ticker, "sell", currentState.Position)
+			size = currentState.Position
+			err = client.PlaceOrder(alert.Ticker, "sell", size)
+			if err == nil {
+				orderId, err = checkOrderStatus(client, alert.Ticker, "sell", size)
+				if err == nil && orderId != "" {
+					usdtValue := size * price
+					db.RecordTransaction(alert.Ticker, "sell", size, price, usdtValue)
+					log.Printf("Sell order %s for %s confirmed, size %f", orderId, alert.Ticker, size)
+				} else {
+					log.Printf("Sell order for %s failed or not filled: %v", alert.Ticker, err)
+				}
+			}
 		}
 	}
 
@@ -153,11 +207,108 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Update state in DB with real position size
-	newPosition := positions[alert.Ticker] // Update with actual position after order
+	newPosition := positions[alert.Ticker]
 	db.UpdateState(alert.Ticker, alert.Signal, newPosition)
+
+	// Record account value
+	totalAccountValue := spotBalance
+	for _, pair := range defaultPairs {
+		if pos, ok := positions[pair]; ok {
+			totalAccountValue += pos * getCurrentPrice(pair)
+		}
+	}
+	db.RecordAccountValue(totalAccountValue)
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "Alert processed: %s %s", alert.Ticker, alert.Signal)
+}
+
+func checkOrderStatus(client *okx.Client, ticker, side string, size float64) (string, error) {
+	endpoint := "/api/v5/trade/order"
+	instId := strings.Replace(ticker, "USDT", "-USDT", 1)
+
+	// Place the order and assume PlaceOrder handles the request
+	orderParams := map[string]string{
+		"instId":  instId,
+		"tdMode":  "cash",
+		"side":    side,
+		"ordType": "market",
+		"sz":      fmt.Sprintf("%.2f", size),
+	}
+	resp, err := client.PlaceOrderWithResponse(alert.Ticker, side, size) // Assuming this returns the response
+	if err != nil {
+		return "", err
+	}
+
+	// Parse the response to get the order ID
+	var orderResp OrderResponse
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if err := json.Unmarshal(body, &orderResp); err != nil {
+		return "", err
+	}
+
+	if orderResp.Code != "0" {
+		return "", fmt.Errorf("OKX API error: %s", orderResp.Msg)
+	}
+
+	if len(orderResp.Data) == 0 {
+		return "", fmt.Errorf("no order data returned")
+	}
+
+	orderId := orderResp.Data[0].OrdId
+	log.Printf("Order placed, ID: %s, InstId: %s, State: %s", orderId, instId, orderResp.Data[0].State)
+
+	// Poll until the order is filled or timed out
+	timeout := time.After(10 * time.Second)
+	tickerPoll := time.NewTicker(1 * time.Second)
+	defer tickerPoll.Stop()
+
+	for {
+		select {
+		case <-timeout:
+			return "", fmt.Errorf("order %s timed out", orderId)
+		case <-tickerPoll.C:
+			// Create a new request to check order status
+			params := map[string]string{
+				"instId": instId,
+				"ordId":  orderId,
+			}
+			resp, err := client.GetOrderStatus(instId, orderId) // Assuming this method exists
+			if err != nil {
+				return "", err
+			}
+
+			body, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				return "", err
+			}
+			defer resp.Body.Close()
+
+			var statusResp OrderResponse
+			if err := json.Unmarshal(body, &statusResp); err != nil {
+				return "", err
+			}
+
+			if statusResp.Code != "0" {
+				return "", fmt.Errorf("OKX API error checking status: %s", statusResp.Msg)
+			}
+
+			if len(statusResp.Data) == 0 {
+				continue
+			}
+
+			state := statusResp.Data[0].State
+			log.Printf("Order %s status: %s", orderId, state)
+			if state == "filled" {
+				return orderId, nil
+			}
+		}
+	}
 }
 
 func stateHandler(w http.ResponseWriter, r *http.Request) {
@@ -190,21 +341,63 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Get USDT balance
+	usdtBalance, err := client.GetSpotBalance()
+	if err != nil {
+		http.Error(w, "Failed to get USDT balance", http.StatusInternalServerError)
+		log.Printf("Error getting USDT balance: %v", err)
+		return
+	}
+
 	// Get current prices for all tickers
 	prices := getCurrentPrices(defaultPairs)
 
-	// Combine states with prices and positions
+	// Combine states with prices, positions, and USDT balance
 	var statesWithPrice []StateWithPrice
+	var totalAccountValue float64 = usdtBalance
 	for _, state := range states {
 		price := prices[state.Ticker]
-		position := positions[state.Ticker] // Real position from OKX
+		position := positions[state.Ticker]
+		positionValue := position * price
+		totalAccountValue += positionValue
 		statesWithPrice = append(statesWithPrice, StateWithPrice{
-			Ticker:     state.Ticker,
-			Signal:     state.Signal,
-			Position:   position,
-			Price:      price,
-			LastUpdate: state.LastUpdate,
+			Ticker:      state.Ticker,
+			Signal:      state.Signal,
+			Position:    position,
+			Price:       price,
+			PositionValue: positionValue,
+			LastUpdate:  state.LastUpdate,
+			USDTBalance: usdtBalance,
 		})
+	}
+
+	// Get historical account values
+	accountValues, err := db.GetAccountValues()
+	if err != nil {
+		log.Printf("Error getting account values: %v", err)
+	}
+
+	// Calculate percentage gain/loss per ticker
+	pairPerformance := make(map[string]float64)
+	for _, ticker := range defaultPairs {
+		transactions, err := db.GetTransactions(ticker)
+		if err != nil {
+			log.Printf("Error getting transactions for %s: %v", ticker, err)
+			continue
+		}
+		var totalBuyUSDT, totalSellUSDT float64
+		for _, t := range transactions {
+			if t.Signal == "buy" {
+				totalBuyUSDT += t.USDTValue
+			} else if t.Signal == "sell" {
+				totalSellUSDT += t.USDTValue
+			}
+		}
+		if totalBuyUSDT > 0 {
+			pairPerformance[ticker] = ((totalSellUSDT - totalBuyUSDT) / totalBuyUSDT) * 100
+		} else {
+			pairPerformance[ticker] = 0
+		}
 	}
 
 	// Render the UI
@@ -219,43 +412,107 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 				th { background-color: #f2f2f2; }
 				.buy { color: green; }
 				.sell { color: red; }
+				.chart-container { width: 70%; height: 400px; }
 			</style>
+			<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 		</head>
 		<body>
 			<h1>Ticker States</h1>
+			<p>USDT Balance: {{printf "%.2f" (index .States 0).USDTBalance}}</p>
+			<p>Total Account Value (USDT): {{printf "%.2f" .TotalAccountValue}}</p>
+			<div class="chart-container">
+				<canvas id="accountValueChart"></canvas>
+			</div>
 			<table>
 				<tr>
 					<th>Ticker</th>
 					<th>Signal</th>
 					<th>Position</th>
+					<th>Value (USDT)</th>
 					<th>Current Price (USDT)</th>
+					<th>% Gain/Loss</th>
 					<th>Last Update</th>
 				</tr>
-				{{range .}}
+				{{range .States}}
 				<tr>
 					<td>{{.Ticker}}</td>
 					<td class="{{.Signal}}">{{.Signal}}</td>
 					<td>{{printf "%.4f" .Position}}</td>
+					<td>{{printf "%.2f" .PositionValue}}</td>
 					<td>{{printf "%.2f" .Price}}</td>
+					<td>{{printf "%.2f" (index $.PairPerformance .Ticker)}}%</td>
 					<td>{{.LastUpdate.Format "2006-01-02 15:04:05"}}</td>
 				</tr>
 				{{end}}
 			</table>
+			<script>
+				const ctx = document.getElementById('accountValueChart').getContext('2d');
+				const accountValueChart = new Chart(ctx, {
+					type: 'line',
+					data: {
+						labels: {{range .AccountValues}}{{.Timestamp.Format "2006-01-02 15:04:05" | printf "'%s'"}},{{end}},
+						datasets: [{
+							label: 'Total Account Value (USDT)',
+							data: {{range .AccountValues}}{{printf "%.2f" .TotalUSDT}},{{end}},
+							borderColor: 'rgb(75, 192, 192)',
+							tension: 0.1
+						}]
+					},
+					options: {
+						scales: {
+							y: { beginAtZero: false }
+						}
+					}
+				});
+			</script>
 		</body>
 		</html>
 	`))
 
-	err = tmpl.Execute(w, statesWithPrice)
+	data := struct {
+		States           []StateWithPrice
+		TotalAccountValue float64
+		AccountValues    []struct{ TotalUSDT float64; Timestamp time.Time }
+		PairPerformance  map[string]float64
+	}{
+		States:           statesWithPrice,
+		TotalAccountValue: totalAccountValue,
+		AccountValues:    accountValues,
+		PairPerformance:  pairPerformance,
+	}
+
+	err = tmpl.Execute(w, data)
 	if err != nil {
 		http.Error(w, "Failed to render state", http.StatusInternalServerError)
 		log.Printf("Template error: %v", err)
 	}
 }
 
+func testHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	log.Println("Starting test suite...")
+	results := testsuite.RunTests("https://crypto-trader15-delicate-flower-4267.fly.dev/webhook")
+
+	// Render test results
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprintln(w, "Test Suite Results:")
+	for _, result := range results {
+		status := "PASS"
+		if !result.Success {
+			status = "FAIL"
+		}
+		fmt.Fprintf(w, "[%s] %s: %s\n", status, result.Step, result.Details)
+	}
+	log.Println("Test suite completed.")
+}
+
 func getCurrentPrice(ticker string) float64 {
 	baseURL := "https://www.okx.com"
 	endpoint := "/api/v5/market/ticker"
-	// Convert ticker to OKX format (e.g., BTCUSDT -> BTC-USDT)
 	instId := strings.Replace(ticker, "USDT", "-USDT", 1)
 	url := fmt.Sprintf("%s%s?instId=%s", baseURL, endpoint, instId)
 
@@ -276,7 +533,12 @@ func getCurrentPrice(ticker string) float64 {
 			Last string `json:"last"`
 		} `json:"data"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading response for %s: %v", ticker, err)
+		return 0
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
 		log.Printf("Error decoding price for %s: %v", ticker, err)
 		return 0
 	}
@@ -302,7 +564,6 @@ func getCurrentPrices(tickers []string) map[string]float64 {
 		price  float64
 	}, len(tickers))
 
-	// Rate limit: OKX allows 3 requests per second per IP
 	const maxConcurrent = 3
 	sem := make(chan struct{}, maxConcurrent)
 
@@ -310,8 +571,8 @@ func getCurrentPrices(tickers []string) map[string]float64 {
 		wg.Add(1)
 		go func(t string) {
 			defer wg.Done()
-			sem <- struct{}{} // Acquire semaphore
-			defer func() { <-sem }() // Release semaphore
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
 			price := getCurrentPrice(t)
 			priceChan <- struct {
@@ -319,12 +580,10 @@ func getCurrentPrices(tickers []string) map[string]float64 {
 				price  float64
 			}{ticker: t, price: price}
 
-			// Sleep to respect rate limit (3 req/s = 333ms per request)
 			time.Sleep(333 * time.Millisecond)
 		}(ticker)
 	}
 
-	// Collect prices
 	go func() {
 		wg.Wait()
 		close(priceChan)
@@ -343,6 +602,7 @@ func main() {
 
 	http.HandleFunc("/webhook", handler)
 	http.HandleFunc("/state", stateHandler)
+	http.HandleFunc("/run-tests", testHandler)
 	port := ":8080"
 	log.Printf("Server starting on port %s...", port)
 	if err := http.ListenAndServe(port, nil); err != nil {
