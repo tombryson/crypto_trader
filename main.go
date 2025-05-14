@@ -98,7 +98,7 @@ func fetchLotSizes() error {
 					log.Printf("Error parsing lotSz for %s: %v", ticker, err)
 					continue
 				}
-				if lotSz < 0.0001 || lotSz > 1 {
+				if lotSz < 0.0000001 || lotSz > 1 {
 					log.Printf("Invalid lotSz for %s: %f, skipping", ticker, lotSz)
 					continue
 				}
@@ -231,7 +231,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	var size float64
 	var orderPlaced bool
 	lotSize, exists := lotSizes[alert.Ticker]
-	if !exists || lotSize < 0.0001 || lotSize > 1 {
+	if !exists || lotSize < 0.0000001 || lotSize > 1 {
 		log.Printf("Invalid or missing lot size for %s (%f), using default 0.1", alert.Ticker, lotSize)
 		lotSize = 0.1 // Fallback for TRXUSDT
 	}

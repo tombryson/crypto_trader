@@ -198,16 +198,7 @@ func (c *Client) PlaceOrder(ticker, side string, size, lotSize float64) error {
 	precision := getPrecision(lotSize)
 	formattedSize := fmt.Sprintf("%.*f", precision, size)
 
-	// Market order (default)
-	// bodyMap := map[string]string{
-	// 	"instId":  instId,
-	// 	"ordType": "market",
-	// 	"side":    side,
-	// 	"sz":      formattedSize,
-	// 	"tdMode":  "cash",
-	// }
-
-	// Uncomment for limit order (set price 0.1% above/below market)
+	// Limit order
 	price := c.getCurrentPrice(ticker)
 	if price == 0 {
 		return fmt.Errorf("failed to get price for %s", ticker)
@@ -243,9 +234,11 @@ func (c *Client) PlaceOrder(ticker, side string, size, lotSize float64) error {
 	if err != nil {
 		return fmt.Errorf("error placing order: %v", err)
 	}
-	if response.Code != "0" || len(response.Data) == 0 || response.Data[0].SCode != "" {
+	if response.Code != "0" || len(response.Data) == 0 || response.Data[0].SCode != "0" {
+		log.Printf("Order failed for %s: code=%s, sCode=%s, sMsg=%s", ticker, response.Code, response.Data[0].SCode, response.Data[0].SMsg)
 		return fmt.Errorf("OKX API order error: code=%s, msg=%s", response.Data[0].SCode, response.Data[0].SMsg)
 	}
+	log.Printf("Order placed successfully for %s: ordId=%s", ticker, response.Data[0].OrdId)
 	return nil
 }
 
@@ -257,6 +250,7 @@ func (c *Client) GetPositions() (map[string]float64, error) {
 			Details []struct {
 				Ccy     string `json:"ccy"`
 				AvailEq string `json:"availEq"`
+				AvailBal string `json:"availBal"`
 			} `json:"details"`
 		} `json:"data"`
 	}
@@ -272,9 +266,14 @@ func (c *Client) GetPositions() (map[string]float64, error) {
 	for _, detail := range balance.Data[0].Details {
 		for _, pair := range []string{"BTCUSDT", "TRXUSDT", "SUIUSDT", "SOLUSDT", "NEARUSDT", "TONUSDT", "ICPUSDT"} {
 			if strings.HasPrefix(pair, detail.Ccy) {
-				availEq, err := strconv.ParseFloat(detail.AvailEq, 64)
+				// Try availEq first, fall back to availBal if empty or invalid
+				availVal := detail.AvailEq
+				if availVal == "" {
+					availVal = detail.AvailBal
+				}
+				availEq, err := strconv.ParseFloat(availVal, 64)
 				if err != nil {
-					log.Printf("Error parsing availEq for %s: %v", detail.Ccy, err)
+					log.Printf("Error parsing availEq/availBal for %s: %v", detail.Ccy, err)
 					continue
 				}
 				positions[pair] = availEq
