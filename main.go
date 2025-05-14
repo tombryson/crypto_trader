@@ -96,7 +96,7 @@ func fetchLotSizes() error {
 				lotSz, err := strconv.ParseFloat(inst.LotSz, 64)
 				if err != nil {
 					log.Printf("Error parsing lotSz for %s: %v", ticker, err)
-					continue
+				 continue
 				}
 				if lotSz < 0.0000001 || lotSz > 1 {
 					log.Printf("Invalid lotSz for %s: %f, skipping", ticker, lotSz)
@@ -187,8 +187,11 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("Available spot balance: %.2f USDT", spotBalance)
-	if spotBalance < 28.77 {
-		log.Printf("Insufficient available balance: %.2f USDT, need 28.77 USDT", spotBalance)
+
+	// Minimum balance: 10 USDT (OKX minimum order value) plus 0.5 USDT buffer
+	minBalance := 10.5
+	if spotBalance < minBalance {
+		log.Printf("Insufficient available balance: %.2f USDT, need %.2f USDT", spotBalance, minBalance)
 		http.Error(w, "Insufficient available balance", http.StatusInternalServerError)
 		return
 	}
@@ -238,31 +241,27 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Using lot size for %s: %f", alert.Ticker, lotSize)
 
 	if alert.Signal == "buy" {
-		if buyCount == 0 {
-			size = spotBalance / price
-			log.Printf("First buy signal for %s, allocating all funds: size=%f", alert.Ticker, size)
-		} else {
-			targetAllocation := availableFunds / float64(buyCount+1)
-			currentPos := currentState.Position
-			targetPos := targetAllocation / price
-			log.Printf("Target allocation for %s: %f, Target position: %f", alert.Ticker, targetAllocation, targetPos)
+		// Adjust allocation based on available funds and existing positions
+		targetAllocation := math.Min(spotBalance, availableFunds/float64(buyCount+1))
+		currentPos := currentState.Position
+		targetPos := targetAllocation / price
+		log.Printf("Target allocation for %s: %f, Target position: %f", alert.Ticker, targetAllocation, targetPos)
 
-			if currentPos > 0 {
-				if currentPos > targetPos {
-					size = currentPos - targetPos
-					log.Printf("Selling excess for %s: size=%f", alert.Ticker, size)
-					err = client.PlaceOrder(alert.Ticker, "sell", size, lotSize)
-					if err == nil {
-						usdtValue := size * price
-						db.RecordTransaction(alert.Ticker, "sell", size, price, usdtValue)
-						log.Printf("Sell order placed for %s, size=%f, USDT value=%f", alert.Ticker, size, usdtValue)
-						orderPlaced = true
-					}
+		if currentPos > 0 {
+			if currentPos > targetPos {
+				size = currentPos - targetPos
+				log.Printf("Selling excess for %s: size=%f", alert.Ticker, size)
+				err = client.PlaceOrder(alert.Ticker, "sell", size, lotSize)
+				if err == nil {
+					usdtValue := size * price
+					db.RecordTransaction(alert.Ticker, "sell", size, price, usdtValue)
+					log.Printf("Sell order placed for %s, size=%f, USDT value=%f", alert.Ticker, size, usdtValue)
+					orderPlaced = true
 				}
-			} else {
-				size = targetPos
-				log.Printf("Buying new position for %s: size=%f", alert.Ticker, size)
 			}
+		} else {
+			size = targetPos
+			log.Printf("Buying new position for %s: size=%f", alert.Ticker, size)
 		}
 
 		// Enforce minimum order value of 10 USDT
