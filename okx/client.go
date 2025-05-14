@@ -119,55 +119,103 @@ func (c *Client) PlaceOrder(ticker, signal string, size float64) error {
 }
 
 func (c *Client) GetSpotBalance() (float64, error) {
-	baseURL := "https://www.okx.com"
-	endpoint := "/api/v5/account/balance"
-	query := "?ccy=USDT"
-	body := ""
+    baseURL := "https://www.okx.com"
+    endpoint := "/api/v5/account/balance"
+    query := "?ccy=USDT"
+    body := ""
 
-	timestamp, signature := c.signRequest("GET", endpoint+query, body)
+    timestamp, signature := c.signRequest("GET", endpoint+query, body)
 
-	req, err := http.NewRequest("GET", baseURL+endpoint+query, nil)
-	if err != nil {
-		return 0, err
-	}
+    req, err := http.NewRequest("GET", baseURL+endpoint+query, nil)
+    if err != nil {
+        return 0, err
+    }
 
-	req.Header.Set("OK-ACCESS-KEY", c.APIKey)
-	req.Header.Set("OK-ACCESS-SIGN", signature)
-	req.Header.Set("OK-ACCESS-TIMESTAMP", timestamp)
-	req.Header.Set("OK-ACCESS-PASSPHRASE", c.Passphrase)
-	req.Header.Set("Content-Type", "application/json")
+    req.Header.Set("OK-ACCESS-KEY", c.APIKey)
+    req.Header.Set("OK-ACCESS-SIGN", signature)
+    req.Header.Set("OK-ACCESS-TIMESTAMP", timestamp)
+    req.Header.Set("OK-ACCESS-PASSPHRASE", c.Passphrase)
+    req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
+    client := &http.Client{}
+    resp, err := client.Do(req)
+    if err != nil {
+        return 0, err
+    }
+    defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return 0, fmt.Errorf("OKX API error: %s, status: %d", string(bodyBytes), resp.StatusCode)
-	}
+    if resp.StatusCode != http.StatusOK {
+        bodyBytes, _ := io.ReadAll(resp.Body)
+        return 0, fmt.Errorf("OKX API error: %s, status: %d", string(bodyBytes), resp.StatusCode)
+    }
 
-	var result struct {
-		Data []struct {
-			Details []struct {
-				CashBal string `json:"cashBal"`
-			} `json:"details"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return 0, err
-	}
+    var result struct {
+        Data []struct {
+            Details []struct {
+                CashBal  string `json:"cashBal"`  // Total balance
+                AvailBal string `json:"availBal"` // Available for trading
+            } `json:"details"`
+        } `json:"data"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return 0, err
+    }
 
-	if len(result.Data) > 0 && len(result.Data[0].Details) > 0 {
-		balance, err := strconv.ParseFloat(result.Data[0].Details[0].CashBal, 64)
-		if err != nil {
-			return 0, err
-		}
-		return balance, nil
-	}
-	return 0, fmt.Errorf("no USDT balance found")
+    if len(result.Data) > 0 && len(result.Data[0].Details) > 0 {
+        balance, err := strconv.ParseFloat(result.Data[0].Details[0].AvailBal, 64)
+        if err != nil {
+            return 0, err
+        }
+        log.Printf("Available USDT balance: %.2f (Total: %s)", balance, result.Data[0].Details[0].CashBal)
+        return balance, nil
+    }
+    return 0, fmt.Errorf("no USDT balance found")
+}
+
+func (c *Client) GetOpenOrders(ticker string) (bool, error) {
+    baseURL := "https://www.okx.com"
+    endpoint := "/api/v5/trade/orders-pending"
+    query := fmt.Sprintf("?instId=%s", strings.Replace(strings.ToUpper(ticker), "USDT", "-USDT", 1))
+    body := ""
+
+    timestamp, signature := c.signRequest("GET", endpoint+query, body)
+
+    req, err := http.NewRequest("GET", baseURL+endpoint+query, nil)
+    if err != nil {
+        return false, err
+    }
+
+    req.Header.Set("OK-ACCESS-KEY", c.APIKey)
+    req.Header.Set("OK-ACCESS-SIGN", signature)
+    req.Header.Set("OK-ACCESS-TIMESTAMP", timestamp)
+    req.Header.Set("OK-ACCESS-PASSPHRASE", c.Passphrase)
+    req.Header.Set("Content-Type", "application/json")
+
+    client := &http.Client{}
+    resp, err := client.Do(req)
+    if err != nil {
+        return false, err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        bodyBytes, _ := io.ReadAll(resp.Body)
+        return false, fmt.Errorf("OKX API error: %s, status: %d", string(bodyBytes), resp.StatusCode)
+    }
+
+    var result struct {
+        Data []struct {
+            OrdId string `json:"ordId"`
+        } `json:"data"`
+    }
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return false, err
+    }
+
+    if len(result.Data) > 0 {
+        log.Printf("Found %d open orders for %s", len(result.Data), ticker)
+    }
+    return len(result.Data) > 0, nil
 }
 
 func (c *Client) GetPositions() (map[string]float64, error) {

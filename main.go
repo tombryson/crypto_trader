@@ -151,11 +151,28 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	spotBalance, err := client.GetSpotBalance()
 	if err != nil {
-		log.Printf("Error getting spot balance: %v", err)
+		log.Printf("Error getting available spot balance: %v", err)
 		http.Error(w, "Failed to get balance", http.StatusInternalServerError)
 		return
 	}
-	log.Printf("Spot balance: %f USDT", spotBalance)
+	log.Printf("Available spot balance: %.2f USDT", spotBalance)
+	if spotBalance < 28.77 {
+		log.Printf("Insufficient available balance: %.2f USDT, need 28.77 USDT", spotBalance)
+		http.Error(w, "Insufficient available balance", http.StatusInternalServerError)
+		return
+	}
+
+	hasOpenOrders, err := client.GetOpenOrders(alert.Ticker)
+	if err != nil {
+		log.Printf("Error checking open orders for %s: %v", alert.Ticker, err)
+		http.Error(w, "Failed to check open orders", http.StatusInternalServerError)
+		return
+	}
+	if hasOpenOrders {
+		log.Printf("Open orders exist for %s, cannot place new order", alert.Ticker)
+		http.Error(w, "Open orders exist", http.StatusInternalServerError)
+		return
+}
 
 	positions, err := client.GetPositions()
 	if err != nil {
