@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -69,19 +70,27 @@ func (c *Client) makeRequest(method, endpoint string, body interface{}, response
 	}
 	defer resp.Body.Close()
 
+	// Read response body for logging
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("error reading response body: %v", err)
+	}
+
+	// Log truncated response body
+	responseStr := string(bodyBytes)
+	if len(responseStr) > 1000 {
+		responseStr = responseStr[:1000] + "..."
+	}
+	log.Printf("OKX API response: %s", responseStr)
+
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := json.Marshal(body)
-		log.Printf("OKX API error: status %d, body %s", resp.StatusCode, string(bodyBytes))
+		log.Printf("OKX API error: status %d, body %s", resp.StatusCode, responseStr)
 		return fmt.Errorf("OKX API error: status %d", resp.StatusCode)
 	}
 
 	if responseHolder != nil {
-		bodyBytes, err := json.RawMessage(json.Marshal(responseHolder))
-		if err != nil {
-			return fmt.Errorf("error initializing response holder: %v", err)
-		}
-		log.Printf("OKX API response: %s", string(bodyBytes))
-		if err := json.NewDecoder(resp.Body).Decode(responseHolder); err != nil {
+		// Decode response into responseHolder using the read body
+		if err := json.Unmarshal(bodyBytes, responseHolder); err != nil {
 			return fmt.Errorf("error decoding response: %v", err)
 		}
 	}
