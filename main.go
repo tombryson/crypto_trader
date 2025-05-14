@@ -9,6 +9,7 @@ import (
 	"html/template"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -53,56 +54,58 @@ func fetchLotSizes() error {
 	endpoint := "/api/v5/public/instruments?instType=SPOT"
 	url := fmt.Sprintf("%s%s", baseURL, endpoint)
 
-	resp, err := http.Get(url)
-	if err != nil {
-		return fmt.Errorf("error fetching instrument details: %v", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("OKX API error: status %d, body %s", resp.StatusCode, string(body))
-	}
-
-	var result struct {
-		Data []struct {
-			InstId string `json:"instId"`
-			LotSz  string `json:"lotSz"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return fmt.Errorf("error decoding instrument details: %v", err)
-	}
-
-	for _, inst := range result.Data {
-		ticker := strings.Replace(inst.InstId, "-USDT", "USDT", 1)
-		if contains(defaultPairs, ticker) {
-			lotSz, err := strconv.ParseFloat(inst.LotSz, 64)
-			if err != nil {
-				log.Printf("Error parsing lotSz for %s: %v", ticker, err)
-				continue
-			}
-			// Validate lot size (should be reasonable, e.g., >= 0.0001)
-			if lotSz < 0.0001 || lotSz > 1 {
-				log.Printf("Invalid lotSz for %s: %f, skipping", ticker, lotSz)
-				continue
-			}
-			lotSizes[ticker] = lotSz
-			log.Printf("Fetched lotSz: %f for %s", lotSz, ticker)
+	for retries := 0; retries < 3; retries++ {
+		resp, err := http.Get(url)
+		if err != nil {
+			log.Printf("Retrying instruments fetch (%d/3): %v", retries+1, err)
+			time.Sleep(time.Second * time.Duration(retries+1))
+			continue
 		}
-	}
+		defer resp.Body.Close()
 
-	// Ensure TRXUSDT has a default lot size if missing
-	if _, exists := lotSizes["TRXUSDT"]; !exists {
-		log.Printf("No lotSz for TRXUSDT, setting default: 0.1")
-		lotSizes["TRXUSDT"] = 0.1
-	}
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			log.Printf("Retrying instruments fetch (%d/3): status %d, body %s", retries+1, resp.StatusCode, string(body))
+			time.Sleep(time.Second * time.Duration(retries+1))
+			continue
+		}
 
-	if len(lotSizes) != len(defaultPairs) {
-		log.Printf("Warning: fetched lot sizes for %d/%d pairs", len(lotSizes), len(defaultPairs))
-	}
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("error reading instrument response: %v", err)
+		}
+		log.Printf("OKX instruments response for SPOT: %s", string(bodyBytes))
 
-	return nil
+		var result struct {
+			Data []struct {
+				InstId string `json:"instId"`
+				LotSz  string `json:"lotSz"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(bodyBytes, &result); err != nil {
+			return fmt.Errorf("error decoding instrument details: %v", err)
+		}
+
+		for _, inst := range result.Data {
+			ticker := strings.Replace(inst.InstId, "-USDT", "USDT", 1)
+			if contains(defaultPairs, ticker) {
+				lotSz, err := strconv.ParseFloat(inst.LotSz, 64)
+				if err != nil {
+					log.Printf("Error parsing lotSz for %s: %v", ticker, err)
+					continue
+				}
+				// Validate lot size (should be reasonable, e.g., >= 0.0001)
+				if lotSz < 0.0001 || lotSz > 1 {
+					log.Printf("Invalid lotSz for %s: %f, skipping", ticker, lotSz)
+					continue
+				}
+				lotSizes[ticker] = lotSz
+				log.Printf("Fetched lotSz: %f for %s", lotSz, ticker)
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("failed to fetch instruments after 3 retries")
 }
 
 func contains(slice []string, item string) bool {
@@ -268,6 +271,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		// Round size to lot size precision
 		if lotSize > 0 {
 			size = float64(int(size/lotSize)) * lotSize
+			log.Printf("Rounded size for %s to %.8f (multiple of lotSize %f)", alert.Ticker, size, lotSize)
 		}
 
 		// Check if we have enough funds for the adjusted size
@@ -275,6 +279,13 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		if usdtValue > spotBalance {
 			log.Printf("Insufficient funds for %s: need %.2f USDT, have %.2f USDT", alert.Ticker, usdtValue, spotBalance)
 			http.Error(w, "Insufficient funds", http.StatusInternalServerError)
+			return
+		}
+
+		// Validate size is a multiple of lotSize
+		if lotSize > 0 && math.Abs(math.Mod(size/lotSize, 1)) > 1e-10 {
+			log.Printf("Invalid size for %s: %f is not a multiple of lotSize %f", alert.Ticker, size, lotSize)
+			http.Error(w, "Invalid order size", http.StatusInternalServerError)
 			return
 		}
 
@@ -304,6 +315,13 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			// Round size to lot size precision
 			if lotSize > 0 {
 				size = float64(int(size/lotSize)) * lotSize
+				log.Printf("Rounded size for %s to %.8f (multiple of lotSize %f)", alert.Ticker, size, lotSize)
+			}
+			// Validate size is a multiple of lotSize
+			if lotSize > 0 && math.Abs(math.Mod(size/lotSize, 1)) > 1e-10 {
+				log.Printf("Invalid size for %s: %f is not a multiple of lotSize %f", alert.Ticker, size, lotSize)
+				http.Error(w, "Invalid order size", http.StatusInternalServerError)
+				return
 			}
 			log.Printf("Selling entire position for %s: size=%.8f", alert.Ticker, size)
 			err = client.PlaceOrder(alert.Ticker, "sell", size, lotSize)
@@ -553,7 +571,7 @@ func testHandler(w http.ResponseWriter, r *http.Request) {
 		if !result.Success {
 			status = "FAIL"
 		}
-		fmt.Fprintf(w, "[%s] %s: %s\n", status, result.Step, result.Details)
+		fmt.Fprintf(w, "[%,environm] %s: %s\n", status, result.Step, result.Details)
 	}
 	log.Println("Test suite completed.")
 }
@@ -645,6 +663,27 @@ func main() {
 
 	if err := fetchLotSizes(); err != nil {
 		log.Fatalf("Failed to fetch lot sizes: %v", err)
+	}
+
+	// Set default lot sizes for missing or invalid pairs
+	defaultLotSizes := map[string]float64{
+		"BTCUSDT":  0.000001,
+		"TRXUSDT":  0.1,
+		"SUIUSDT":  0.0001,
+		"SOLUSDT":  0.0001,
+		"NEARUSDT": 0.0001,
+		"TONUSDT":  0.0001,
+		"ICPUSDT":  0.0001,
+	}
+	for _, ticker := range defaultPairs {
+		if _, exists := lotSizes[ticker]; !exists {
+			lotSizes[ticker] = defaultLotSizes[ticker]
+			log.Printf("No lotSz for %s, setting default: %f", ticker, defaultLotSizes[ticker])
+		}
+	}
+
+	if len(lotSizes) != len(defaultPairs) {
+		log.Printf("Warning: fetched lot sizes for %d/%d pairs", len(lotSizes), len(defaultPairs))
 	}
 
 	http.HandleFunc("/webhook", handler)
