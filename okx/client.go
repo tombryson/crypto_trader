@@ -199,35 +199,33 @@ func (c *Client) PlaceOrder(ticker, side string, size, lotSize float64) error {
 	formattedSize := fmt.Sprintf("%.*f", precision, size)
 
 	// Market order (default)
+	// bodyMap := map[string]string{
+	// 	"instId":  instId,
+	// 	"ordType": "market",
+	// 	"side":    side,
+	// 	"sz":      formattedSize,
+	// 	"tdMode":  "cash",
+	// }
+
+	// Uncomment for limit order (set price 0.1% above/below market)
+	price := c.getCurrentPrice(ticker)
+	if price == 0 {
+		return fmt.Errorf("failed to get price for %s", ticker)
+	}
+	priceAdjust := price
+	if side == "buy" {
+		priceAdjust *= 1.001 // 0.1% above for buy
+	} else {
+		priceAdjust *= 0.999 // 0.1% below for sell
+	}
 	bodyMap := map[string]string{
 		"instId":  instId,
-		"ordType": "market",
+		"ordType": "limit",
 		"side":    side,
 		"sz":      formattedSize,
 		"tdMode":  "cash",
+		"px":      fmt.Sprintf("%.8f", priceAdjust),
 	}
-
-	// Uncomment for limit order (set price 0.1% above/below market)
-	/*
-		price := c.getCurrentPrice(ticker)
-		if price == 0 {
-			return fmt.Errorf("failed to get price for %s", ticker)
-		}
-		priceAdjust := price
-		if side == "buy" {
-			priceAdjust *= 1.001 // 0.1% above for buy
-		} else {
-			priceAdjust *= 0.999 // 0.1% below for sell
-		}
-		bodyMap := map[string]string{
-			"instId":  instId,
-			"ordType": "limit",
-			"side":    side,
-			"sz":      formattedSize,
-			"tdMode":  "cash",
-			"px":      fmt.Sprintf("%.8f", priceAdjust),
-		}
-	*/
 
 	log.Printf("Formatted order size for %s: %s (lotSize: %f, precision: %d)", ticker, formattedSize, lotSize, precision)
 	log.Printf("Sending order request: %v", bodyMap)
