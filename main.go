@@ -23,13 +23,13 @@ type Alert struct {
 }
 
 type StateWithPrice struct {
-	Ticker      string
-	Signal      string
-	Position    float64
-	Price       float64
+	Ticker        string
+	Signal        string
+	Position      float64
+	Price         float64
 	PositionValue float64 // Value of the position in USDT
-	LastUpdate  time.Time
-	USDTBalance float64
+	LastUpdate    time.Time
+	USDTBalance   float64
 }
 
 type Transaction struct {
@@ -43,9 +43,9 @@ type Transaction struct {
 }
 
 var (
-	mu            sync.Mutex
-	defaultPairs  = []string{"BTCUSDT", "TRXUSDT", "SUIUSDT", "SOLUSDT", "NEARUSDT", "TONUSDT", "ICPUSDT"}
-	lotSizes      = make(map[string]float64)
+	mu           sync.Mutex
+	defaultPairs = []string{"BTCUSDT", "TRXUSDT", "SUIUSDT", "SOLUSDT", "NEARUSDT", "TONUSDT", "ICPUSDT"}
+	lotSizes     = make(map[string]float64)
 )
 
 func fetchLotSizes() error {
@@ -82,13 +82,24 @@ func fetchLotSizes() error {
 				log.Printf("Error parsing lotSz for %s: %v", ticker, err)
 				continue
 			}
+			// Validate lot size (should be reasonable, e.g., >= 0.0001)
+			if lotSz < 0.0001 || lotSz > 1 {
+				log.Printf("Invalid lotSz for %s: %f, skipping", ticker, lotSz)
+				continue
+			}
 			lotSizes[ticker] = lotSz
 			log.Printf("Fetched lotSz: %f for %s", lotSz, ticker)
 		}
 	}
 
+	// Ensure TRXUSDT has a default lot size if missing
+	if _, exists := lotSizes["TRXUSDT"]; !exists {
+		log.Printf("No lotSz for TRXUSDT, setting default: 0.1")
+		lotSizes["TRXUSDT"] = 0.1
+	}
+
 	if len(lotSizes) != len(defaultPairs) {
-		return fmt.Errorf("failed to fetch lot sizes for all pairs")
+		log.Printf("Warning: fetched lot sizes for %d/%d pairs", len(lotSizes), len(defaultPairs))
 	}
 
 	return nil
@@ -172,7 +183,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Open orders exist for %s, cannot place new order", alert.Ticker)
 		http.Error(w, "Open orders exist", http.StatusInternalServerError)
 		return
-}
+	}
 
 	positions, err := client.GetPositions()
 	if err != nil {
@@ -211,7 +222,12 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 	var size float64
 	var orderPlaced bool
-	lotSize := lotSizes[alert.Ticker]
+	lotSize, exists := lotSizes[alert.Ticker]
+	if !exists || lotSize < 0.0001 || lotSize > 1 {
+		log.Printf("Invalid or missing lot size for %s (%f), using default 0.1", alert.Ticker, lotSize)
+		lotSize = 0.1 // Fallback for TRXUSDT
+	}
+	log.Printf("Using lot size for %s: %f", alert.Ticker, lotSize)
 
 	if alert.Signal == "buy" {
 		if buyCount == 0 {
@@ -227,7 +243,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 				if currentPos > targetPos {
 					size = currentPos - targetPos
 					log.Printf("Selling excess for %s: size=%f", alert.Ticker, size)
-					err = client.PlaceOrder(alert.Ticker, "sell", size)
+					err = client.PlaceOrder(alert.Ticker, "sell", size, lotSize)
 					if err == nil {
 						usdtValue := size * price
 						db.RecordTransaction(alert.Ticker, "sell", size, price, usdtValue)
@@ -264,7 +280,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 		if size > 0 {
 			log.Printf("Attempting to place buy order for %s with size %.8f", alert.Ticker, size)
-			err = client.PlaceOrder(alert.Ticker, "buy", size, lotSizes[alert.Ticker])
+			err = client.PlaceOrder(alert.Ticker, "buy", size, lotSize)
 			if err == nil {
 				usdtValue := size * price
 				db.RecordTransaction(alert.Ticker, "buy", size, price, usdtValue)
@@ -290,7 +306,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 				size = float64(int(size/lotSize)) * lotSize
 			}
 			log.Printf("Selling entire position for %s: size=%.8f", alert.Ticker, size)
-			err = client.PlaceOrder(alert.Ticker, "sell", size, lotSizes[alert.Ticker])
+			err = client.PlaceOrder(alert.Ticker, "sell", size, lotSize)
 			if err == nil {
 				usdtValue := size * price
 				db.RecordTransaction(alert.Ticker, "sell", size, price, usdtValue)
@@ -391,13 +407,13 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 		positionValue := position * price
 		totalAccountValue += positionValue
 		statesWithPrice = append(statesWithPrice, StateWithPrice{
-			Ticker:      state.Ticker,
-			Signal:      state.Signal,
-			Position:    position,
-			Price:       price,
+			Ticker:        state.Ticker,
+			Signal:        state.Signal,
+			Position:      position,
+			Price:         price,
 			PositionValue: positionValue,
-			LastUpdate:  state.LastUpdate,
-			USDTBalance: usdtBalance,
+			LastUpdate:    state.LastUpdate,
+			USDTBalance:   usdtBalance,
 		})
 	}
 
@@ -497,15 +513,15 @@ func stateHandler(w http.ResponseWriter, r *http.Request) {
 	`))
 
 	data := struct {
-		States           []StateWithPrice
+		States            []StateWithPrice
 		TotalAccountValue float64
-		AccountValues    []struct{ TotalUSDT float64; Timestamp time.Time }
-		PairPerformance  map[string]float64
+		AccountValues     []struct{ TotalUSDT float64; Timestamp time.Time }
+		PairPerformance   map[string]float64
 	}{
-		States:           statesWithPrice,
+		States:            statesWithPrice,
 		TotalAccountValue: totalAccountValue,
-		AccountValues:    accountValues,
-		PairPerformance:  pairPerformance,
+		AccountValues:     accountValues,
+		PairPerformance:   pairPerformance,
 	}
 
 	err = tmpl.Execute(w, data)
