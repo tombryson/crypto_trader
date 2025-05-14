@@ -74,7 +74,11 @@ func fetchLotSizes() error {
 		if err != nil {
 			return fmt.Errorf("error reading instrument response: %v", err)
 		}
-		log.Printf("OKX instruments response for SPOT: %s", string(bodyBytes))
+		responseStr := string(bodyBytes)
+		if len(responseStr) > 1000 {
+			responseStr = responseStr[:1000] + "..."
+		}
+		log.Printf("OKX instruments response for SPOT: %s", responseStr)
 
 		var result struct {
 			Data []struct {
@@ -94,7 +98,6 @@ func fetchLotSizes() error {
 					log.Printf("Error parsing lotSz for %s: %v", ticker, err)
 					continue
 				}
-				// Validate lot size (should be reasonable, e.g., >= 0.0001)
 				if lotSz < 0.0001 || lotSz > 1 {
 					log.Printf("Invalid lotSz for %s: %f, skipping", ticker, lotSz)
 					continue
@@ -156,11 +159,25 @@ func handler(w http.ResponseWriter, r *http.Request) {
 		alert.Ticker, currentState.Signal, currentState.Position, currentState.LastUpdate)
 
 	if currentState.Signal == alert.Signal {
-		log.Printf("Ticker %s already in %s state, skipping order (to force order, remove this check for testing)",
-			alert.Ticker, alert.Signal)
+		log.Printf("Ticker %s already in %s state, skipping order", alert.Ticker, alert.Signal)
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "Alert processed (no action): %s %s", alert.Ticker, alert.Signal)
 		return
+	}
+
+	// Check for open orders across all pairs
+	for _, pair := range defaultPairs {
+		hasOpenOrders, err := client.GetOpenOrders(pair)
+		if err != nil {
+			log.Printf("Error checking open orders for %s: %v", pair, err)
+			http.Error(w, "Failed to check open orders", http.StatusInternalServerError)
+			return
+		}
+		if hasOpenOrders {
+			log.Printf("Open orders exist for %s, cannot place new order for %s", pair, alert.Ticker)
+			http.Error(w, "Open orders exist for other pairs", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	spotBalance, err := client.GetSpotBalance()
@@ -173,18 +190,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	if spotBalance < 28.77 {
 		log.Printf("Insufficient available balance: %.2f USDT, need 28.77 USDT", spotBalance)
 		http.Error(w, "Insufficient available balance", http.StatusInternalServerError)
-		return
-	}
-
-	hasOpenOrders, err := client.GetOpenOrders(alert.Ticker)
-	if err != nil {
-		log.Printf("Error checking open orders for %s: %v", alert.Ticker, err)
-		http.Error(w, "Failed to check open orders", http.StatusInternalServerError)
-		return
-	}
-	if hasOpenOrders {
-		log.Printf("Open orders exist for %s, cannot place new order", alert.Ticker)
-		http.Error(w, "Open orders exist", http.StatusInternalServerError)
 		return
 	}
 
@@ -571,7 +576,7 @@ func testHandler(w http.ResponseWriter, r *http.Request) {
 		if !result.Success {
 			status = "FAIL"
 		}
-		fmt.Fprintf(w, "[%,environm] %s: %s\n", status, result.Step, result.Details)
+		fmt.Fprintf(w, "[%s] %s: %s\n", status, result.Step, result.Details)
 	}
 	log.Println("Test suite completed.")
 }
