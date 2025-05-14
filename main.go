@@ -264,7 +264,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 
 		if size > 0 {
 			log.Printf("Attempting to place buy order for %s with size %.8f", alert.Ticker, size)
-			err = client.PlaceOrder(alert.Ticker, "buy", size)
+			err = client.PlaceOrder(alert.Ticker, "buy", size, lotSizes[alert.Ticker])
 			if err == nil {
 				usdtValue := size * price
 				db.RecordTransaction(alert.Ticker, "buy", size, price, usdtValue)
@@ -274,6 +274,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 				log.Printf("Failed to place buy order for %s: %v", alert.Ticker, err)
 			}
 		}
+
 	} else if alert.Signal == "sell" {
 		if currentState.Position > 0 {
 			size = currentState.Position
@@ -289,7 +290,7 @@ func handler(w http.ResponseWriter, r *http.Request) {
 				size = float64(int(size/lotSize)) * lotSize
 			}
 			log.Printf("Selling entire position for %s: size=%.8f", alert.Ticker, size)
-			err = client.PlaceOrder(alert.Ticker, "sell", size)
+			err = client.PlaceOrder(alert.Ticker, "sell", size, lotSizes[alert.Ticker])
 			if err == nil {
 				usdtValue := size * price
 				db.RecordTransaction(alert.Ticker, "sell", size, price, usdtValue)
@@ -298,8 +299,6 @@ func handler(w http.ResponseWriter, r *http.Request) {
 			} else {
 				log.Printf("Failed to place sell order for %s: %v", alert.Ticker, err)
 			}
-		} else {
-			log.Printf("No position to sell for %s", alert.Ticker)
 		}
 	}
 
